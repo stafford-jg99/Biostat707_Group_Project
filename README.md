@@ -31,9 +31,9 @@ Data Wrangling: JS, TD
 
 Descriptive Analysis: JS, TD
 
-Modeling: AT
+Modeling: JR
 
-Modeling Evaluation: JR
+Modeling Evaluation: AT
 
 Project write-up/presentation: Everyone 
 
