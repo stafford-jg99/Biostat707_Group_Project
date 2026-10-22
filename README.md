@@ -29,7 +29,7 @@ The Repository for the 707 Project
 # Tentative Assignment of Roles:
 Data Wrangling: JS
 
-Descriptive Analysis:
+Descriptive Analysis: 
 
 Inferential Stats: 
 
