@@ -24,6 +24,13 @@ The Repository for the 707 Project
 1. Andreas Tjavaras (andreas.tjavaras@duke.edu):
 2. Tim Deng (tim.deng@duke.edu):
 3. Joe Stafford (joseph.stafford@duke.edu): 
-4. JT Rapp (jt.rapp@duke.edu): 
+4. JT Rapp (jt.rapp@duke.edu):
 
-Potential Roles: Data Cleaning, handling of missing data, descriptive analysis, predictor/Variable Selection, Cross Validation Process, Model fitting, etc.
+# Tentative Assignment of Roles:
+Data Wrangling: JS
+Descriptive Analysis:
+Inferential Stats: 
+Project write-up/presentation: Everyone 
+
+# Tasks to be completed: 
+Data Cleaning, handling of missing data, descriptive analysis, predictor/Variable Selection, Cross Validation Process, Model fitting, etc.
