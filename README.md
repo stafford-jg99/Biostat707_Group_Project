@@ -26,12 +26,12 @@ The Repository for the 707 Project
 3. Joe Stafford (joseph.stafford@duke.edu): 
 4. JT Rapp (jt.rapp@duke.edu):
 
-# Tentative Assignment of Roles:
+# Tentative Assignment of Roles (subject to change as project advances):
 Data Wrangling: JS, TD
 
 Descriptive Analysis: JS, TD
 
-Modelling: AT
+Modeling: AT, JR
 
 Project write-up/presentation: Everyone 
 
