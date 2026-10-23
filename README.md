@@ -27,13 +27,13 @@ The Repository for the 707 Project
 4. JT Rapp (jt.rapp@duke.edu):
 
 # Tentative Assignment of Roles (subject to change as project advances):
-Data Wrangling: JS, TD
+Data Wrangling: Joe, Tim 
 
-Descriptive Analysis: JS, TD
+Descriptive Analysis: Joe, Tim
 
-Modeling: JR
+Modeling: JT
 
-Modeling Evaluation: AT
+Modeling Evaluation: Andreas
 
 Project write-up/presentation: Everyone 
 
