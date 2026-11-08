@@ -1,0 +1,213 @@
+---
+title: "707 Final Project Code"
+author: "Joe Stafford, ..., ..., ..."
+format: html
+editor: visual
+---
+
+## Libraries and Data Download
+
+```{r}
+source("scripts/download_data.R")
+library(tidyverse) # add other libraries as needed
+library(naniar)
+
+## data read in 
+files <- list.files("data/raw", pattern = "\\.csv$", full.names = TRUE)
+air_qual_data <- do.call(rbind, lapply(files, read.csv))
+
+
+
+```
+
+## Data Cleaning & Exploratory Analysis - JS 
+
+```{r}
+# Collapse the year, month, day, and hour columns into one column variable
+air_qual_data <- air_qual_data |>
+  mutate(date_plus_time = make_datetime(year, month, day, hour, tz = "Asia/Shanghai"))
+
+# change the wind direction and station variables into categorical/factor variables. Then remove the No column 
+air_qual_data <- air_qual_data |>
+  mutate(wd = factor(wd), station = factor(station)) |>
+  select(-No)
+
+# establish the time range for data collection. 
+range(air_qual_data$date_plus_time)
+
+#Print the min, max, and number of missing values for each variable. 
+summary(air_qual_data)
+
+# Plot to display the percentage of missing for each variable
+# Readable names for the plots (reuse in later figures)
+vars_names <- c(
+  PM2.5 = "PM2.5",
+  PM10  = "PM10",
+  SO2   = "Sulfur dioxide (SO2)",
+  NO2   = "Nitrogen dioxide (NO2)",
+  CO    = "Carbon monoxide (CO)",
+  O3    = "Ozone (O3)",
+  TEMP  = "Temperature",
+  PRES  = "Air pressure",
+  DEWP  = "Dew point",
+  RAIN  = "Rainfall",
+  wd    = "Wind direction",
+  WSPM  = "Wind speed"
+)
+
+air_qual_data |>
+  select(all_of(names(vars_names))) |>
+  gg_miss_var(show_pct = TRUE) +
+  scale_x_discrete(labels = vars_names) +
+  labs(title = "Missingness within Hourly Readings",
+       x = NULL, y = "Percent Missing")
+
+# Code to create a heatmap that shows where the missingess is located in terms of time and station 
+air_qual_data |>
+  mutate(month_start = floor_date(date_plus_time, "month")) |>
+  group_by(station, month_start) |>
+  summarize(across(all_of(names(vars_names)), ~ mean(is.na(.x)) * 100),
+            .groups = "drop") |>
+  pivot_longer(all_of(names(vars_names)),
+               names_to = "variable", values_to = "pct_missing") |>
+  filter(variable %in% c("PM2.5", "PM10", "SO2", "NO2", "CO", "O3")) |>
+  mutate(variable = factor(vars_names[variable], levels = rev(vars_names))) |>
+  ggplot(aes(month_start, variable, fill = pct_missing)) +
+  geom_tile(width = 32 * 24 * 3600) +
+  facet_wrap(~ station, ncol = 3) +
+  scale_x_datetime(date_breaks = "2 years", date_labels = "%Y") +
+  scale_fill_viridis_c(name = "% missing") +
+  labs(title = "Visualizing Missingness at Each Station across Time",
+       x = NULL, y = NULL) +
+  theme_minimal(base_size = 9)
+
+# create a column with just the date and no time 
+air_qual_data <- air_qual_data |>
+  mutate(date = as_date(date_plus_time))
+
+
+# code to create an object that stores the average PM2.5 for each day. This is done for every station. We make days with less than 20 hours of measurements NA. 
+daily_avg_pm25 <- air_qual_data |>
+  group_by(station, date) |>
+  summarize(
+    hours_observed = sum(!is.na(PM2.5)),
+    pm25_avg = if_else( hours_observed>= 20, mean(PM2.5, na.rm = TRUE), NA_real_),
+    .groups = "drop"
+  )
+
+# code to establish the health threshold of 75 µg/m³ & to build a column that marks when threshold is surpassed 
+
+daily_avg_pm25 <- daily_avg_pm25 |>
+  mutate(h_threshold = pm25_avg > 75)
+
+# code to claculate how many observations we have per station per day, the number of days that we removed due to not having 20 hours of measurements, the percentage that surpass the health threshold 
+daily_avg_pm25 |>
+  summarize(
+    n_perstation_perday= n(),
+    total_dropped = sum(is.na(h_threshold)),
+    pct_over_threshold = mean(h_threshold, na.rm = TRUE) * 100
+  )
+
+# heat map 
+daily_avg_pm25 |>
+  mutate(yr = year(date), mon = month(date, label = TRUE)) |>
+  group_by(yr, mon) |>
+  summarize(pct_over = mean(h_threshold, na.rm = TRUE) * 100, .groups = "drop") |>
+  ggplot(aes(mon, factor(yr), fill = pct_over)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(pct_over)), size = 3.5) +
+  scale_y_discrete(limits = rev) +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1, name = "% over 75") +
+  labs(title = "Percent of Station-Days over 75 µg/m³",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(panel.grid = element_blank())
+
+
+# ADD two columns to the daily_avg_pm25 dataset...the first new column shows the next day's average pm25 ...the second states whether its over threshold
+two_day_pm25 <- daily_avg_pm25 |>
+  group_by(station) |>
+  arrange(date, .by_group = TRUE) |>
+  mutate(next_day_avg = lead(pm25_avg),
+         next_day_thresh = lead(h_threshold)) |>
+  ungroup() |>
+  filter(date < as.Date("2016-02-29"))
+
+
+# check on correlation and what would happen if we went off the previous day's reading to determine whether the threshold would be passed on the next day 
+
+two_day_pm25 |>
+  summarize(
+    correlation = cor(pm25_avg, next_day_avg, use = "complete.obs"),
+    pct_same = mean(h_threshold == next_day_thresh, na.rm = TRUE) * 100,
+    pct_no = mean(!next_day_thresh, na.rm = TRUE) * 100
+  )
+
+acf_by_station <- daily_avg_pm25 |>
+  filter(date < as.Date("2016-03-01")) |>
+  arrange(station, date) |>
+  group_by(station) |>
+  reframe(lag = 0:14,
+          acf = as.numeric(acf(pm25_avg, na.action = na.pass,
+                               lag.max = 14, plot = FALSE)$acf))
+
+# ACF plots
+acf_by_station |>
+  filter(lag > 0) |>
+  ggplot(aes(lag, acf)) +
+  geom_col(width = 0.3) +
+  geom_hline(yintercept = 0) +
+  geom_hline(yintercept = c(-1.96, 1.96) / sqrt(1096),
+             linetype = 2, color = "purple") +
+  facet_wrap(~ station, ncol = 4) +
+  labs(title = "Autocorrelation of daily PM2.5 by station",
+       x = "Days back", y = "Autocorrelation") +
+  theme_minimal()
+
+
+
+# Compare each station to each other and then calcuate the correlation (use only training years)
+station_cor <- daily_avg_pm25 |>
+  filter(date < as.Date("2016-03-01")) |>
+  select(station, date, pm25_avg) |>
+  pivot_wider(names_from = station, values_from = pm25_avg) |>
+  select(-date) |>
+  cor(use = "pairwise.complete.obs")
+
+# correlation min and max values
+range(station_cor[upper.tri(station_cor)])
+
+# Heatmap of station correlation
+station_order <- rownames(station_cor)[hclust(as.dist(1 - station_cor))$order]
+
+as_tibble(station_cor, rownames = "station_1") |>
+  pivot_longer(-station_1, names_to = "station_2", values_to = "correlation") |>
+  mutate(station_1 = factor(station_1, levels = station_order),
+         station_2 = factor(station_2, levels = station_order)) |>
+  ggplot(aes(station_1, station_2, fill = correlation)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(correlation, 2)), size = 2.8) +
+  scale_fill_distiller(palette = "YlOrRd", direction = 1) +
+  labs(title = "Station Correlation",
+       x = NULL, y = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+
+
+
+
+## CHECK FOR ODD VALUES NEXT/ # Build Table 1 / IMPUTATION
+
+
+```
+
+## subsequent aims 
+
+```{r}
+
+```
+
+```{r}
+
+```
