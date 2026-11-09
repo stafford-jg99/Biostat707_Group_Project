@@ -1,6 +1,6 @@
 ---
 title: "707 Final Project Code"
-author: "Joe Stafford, ..., ..., ..."
+author: "Joe Stafford, Tim Deng, ..., ..."
 format: html
 editor: visual
 ---
@@ -20,7 +20,7 @@ air_qual_data <- do.call(rbind, lapply(files, read.csv))
 
 ```
 
-## Data Cleaning & Exploratory Analysis - JS 
+## Data Cleaning & Exploratory Analysis - JS, TD
 
 ```{r}
 # Collapse the year, month, day, and hour columns into one column variable
@@ -200,6 +200,225 @@ as_tibble(station_cor, rownames = "station_1") |>
 ## CHECK FOR ODD VALUES NEXT/ # Build Table 1 / IMPUTATION
 
 
+```
+
+## Data Cleaning Rules, Feature Table & Table 1 - TD
+
+The hourly data are cleaned and summarised into one row per station-day by `scripts/build_features.R`; the imputation functions are in `scripts/impute.R`. The resulting table (`data/processed/station_day_features.csv`) is the input to all models. Two aspects of the design, the prediction window (24 h vs 48 h) and the train/test split, are still under discussion and are noted where they arise.
+
+```{r}
+#| message: false
+source("scripts/build_features.R")
+source("scripts/impute.R")
+```
+
+### Cleaning rules
+
+Each rule applied to the hourly data, with the number of hourly values it touched. The only values changed are the 18 O3 readings stuck at 1071 µg/m³ at Dongsi (15–17 Aug 2013) and the carry-forward of short gaps; everything else is kept and reported.
+
+```{r}
+cleaning_log |>
+  mutate(n_hours = format(n_hours, big.mark = ",")) |>
+  knitr::kable(col.names = c("Rule", "Action", "Hourly values"),
+               align = "llr", caption = "Cleaning rules applied to the hourly data")
+```
+
+Two things deserve a note in the report. PM2.5 exceeds PM10 in about 5% of hours, which is physically impossible since PM2.5 is a subset of PM10; the pattern is spread across all stations and years, so it is noise between two instruments rather than a few bad records, and we keep both values. The handful of readings at exactly 999 µg/m³ sit on real extreme events (the PM2.5 one is 02:00 on Chinese New Year's Eve 2016, when neighbouring stations read 941 and 957; the PM10 ones fall on the 15 Apr 2015 dust storm), so they are treated as right-censored at the instrument ceiling rather than as errors.
+
+### Where the missingness is
+
+Hours where all six pollutants are missing at once are monitor outages, and they are the informative part of the missingness: they come in blocks, cluster in 2014 and 2016, and differ by station. Gaps of 1–3 hours in a single variable are filled by carrying the last value forward (this recovers about 40% of the missing PM2.5 hours); longer gaps stay missing and are counted in the `n_obs_pm25_*` and `n_outage_*` features, so the models can use the fact that a monitor was down.
+
+```{r}
+outage_days <- hourly |>
+  group_by(station, date) |>
+  summarise(outage_hours = sum(outage), .groups = "drop") |>
+  filter(outage_hours > 0)
+
+outage_days |>
+  summarise(
+    `station-days with any outage` = n(),
+    `whole-day outages (24 h)`     = sum(outage_hours == 24),
+    `median outage length (h)`     = median(outage_hours),
+    `longest outage (h)`           = max(outage_hours)
+  ) |>
+  knitr::kable(caption = "Monitor outages (all six pollutants missing)")
+
+hourly |>
+  group_by(station, year) |>
+  summarise(outage_hours = sum(outage), .groups = "drop") |>
+  pivot_wider(names_from = year, values_from = outage_hours) |>
+  knitr::kable(caption = "Outage hours by station and calendar year")
+```
+
+### The station-day table
+
+Each row is a station and a day *d*; the features summarise hours 00–23 of day *d* (`_24h`) or days *d − 1* and *d* (`_48h`), and the outcome `y_exceed` is whether the mean PM2.5 on day *d + 1* is above 75 µg/m³. Station-days whose next day has fewer than 20 observed PM2.5 hours have no outcome and are dropped (497 of 17,532). Both windows are included so that they can be compared; the final models will use one of them, since the two sets of features are highly correlated. Target days before `r format(test_start)` form the training set (three March–February years, `season_year` 2013–2015) and the final year is the test set. The `season_year` column also allows rolling-origin validation within the training years (train on 2013, validate on 2014, and so on).
+
+```{r}
+station_day |>
+  count(period, y_exceed) |>
+  group_by(period) |>
+  mutate(pct = round(100 * n / sum(n), 1)) |>
+  ungroup() |>
+  knitr::kable(caption = "Outcome by period")
+
+glimpse(select(station_day, 1:14))
+```
+
+### Table 1
+
+```{r}
+med_iqr <- function(x) {
+  q <- quantile(x, c(0.25, 0.5, 0.75), na.rm = TRUE)
+  sprintf("%.1f [%.1f, %.1f]", q[2], q[1], q[3])
+}
+pct <- function(x) sprintf("%.1f%%", 100 * mean(x, na.rm = TRUE))
+
+table1_vars <- c(
+  "Next-day mean PM2.5 (µg/m³)"  = "y_pm25_next",
+  "PM2.5, 24 h mean (µg/m³)"     = "PM25_mean_24h",
+  "PM2.5, last hour (µg/m³)"     = "PM25_last",
+  "PM10, 24 h mean (µg/m³)"      = "PM10_mean_24h",
+  "SO2, 24 h mean (µg/m³)"       = "SO2_mean_24h",
+  "NO2, 24 h mean (µg/m³)"       = "NO2_mean_24h",
+  "CO, 24 h mean (µg/m³)"        = "CO_mean_24h",
+  "O3, 24 h mean (µg/m³)"        = "O3_mean_24h",
+  "Temperature, 24 h mean (°C)"  = "TEMP_mean_24h",
+  "Dew point, 24 h mean (°C)"    = "DEWP_mean_24h",
+  "Pressure, 24 h mean (hPa)"    = "PRES_mean_24h",
+  "Wind speed, 24 h mean (m/s)"  = "WSPM_mean_24h",
+  "Rain, 24 h total (mm)"        = "RAIN_total_24h"
+)
+
+summarise_table1 <- function(d) {
+  d |>
+    summarise(
+      "Station-days"                   = format(n(), big.mark = ","),
+      "Next day over 75 µg/m³"         = pct(y_exceed),
+      "Today over 75 µg/m³"            = pct(exceed_today),
+      across(all_of(table1_vars), med_iqr),
+      "Days with < 24 h of PM2.5"      = pct(n_obs_pm25_24h < 24),
+      "Days with any outage hour"      = pct(n_outage_24h > 0),
+      .groups = "drop"
+    )
+}
+
+table1 <- bind_rows(
+  station_day |> mutate(period = "Overall") |> group_by(period) |> summarise_table1(),
+  station_day |> group_by(period) |> summarise_table1()
+) |>
+  pivot_longer(-period, names_to = "Characteristic", values_to = "value") |>
+  pivot_wider(names_from = period, values_from = value) |>
+  select(Characteristic, Overall, train, test)
+
+knitr::kable(table1, align = "lrrr",
+             caption = "Table 1. Station-day characteristics, median [IQR] unless noted")
+```
+
+```{r}
+station_day |>
+  group_by(station) |>
+  summarise(
+    "Station-days"           = n(),
+    "Next day over 75 µg/m³" = pct(y_exceed),
+    "Next-day PM2.5"         = med_iqr(y_pm25_next),
+    "Days with outage hours" = pct(n_outage_24h > 0),
+    "Days missing a feature" = pct(if_any(ends_with("_24h"), is.na)),
+    .groups = "drop"
+  ) |>
+  knitr::kable(align = "lrrrrr", caption = "Table 1b. By station")
+```
+
+### Class balance over time
+
+The outcome is not rare: roughly two days in five exceed the threshold. But the rate drifts downward over the study (45% of days in 2013–14 to 34% in 2015–16, then 39% in the test year), consistent with Beijing's clean-air measures, and it is strongly seasonal. A model calibrated on the training years may therefore over-predict exceedance in the test year, a point to check in the calibration plots.
+
+```{r}
+station_day |>
+  group_by(season_year, period) |>
+  summarise(n = n(), pct_exceed = 100 * mean(y_exceed), .groups = "drop") |>
+  knitr::kable(digits = 1, caption = "Exceedance rate by March-to-February year")
+
+station_day |>
+  mutate(month_start = floor_date(target_date, "month")) |>
+  group_by(month_start, period) |>
+  summarise(pct_exceed = 100 * mean(y_exceed), .groups = "drop") |>
+  ggplot(aes(month_start, pct_exceed, colour = period)) +
+  geom_line() +
+  geom_point(size = 1) +
+  geom_vline(xintercept = test_start, linetype = 2) +
+  scale_x_date(date_breaks = "6 months", date_labels = "%b %Y") +
+  labs(title = "Share of station-days with next-day PM2.5 over 75 µg/m³",
+       x = NULL, y = "% of station-days", colour = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### Predictors versus the outcome (training years only)
+
+Today's PM2.5 is the obvious predictor, and the meteorology behaves as expected: exceedance days follow humid, still days with southerly winds (`wind_v_mean` negative) and lower pressure; clean days follow dry northerly wind. These plots use training rows only.
+
+```{r}
+#| fig-height: 6
+plot_vars <- c("PM25_mean_24h", "PM25_last", "DEWP_mean_24h", "WSPM_mean_24h",
+               "wind_v_mean_24h", "PRES_mean_24h", "TEMP_mean_24h", "CO_mean_24h")
+
+station_day |>
+  filter(period == "train") |>
+  select(y_exceed, all_of(plot_vars)) |>
+  pivot_longer(-y_exceed, names_to = "feature") |>
+  mutate(feature = factor(feature, levels = plot_vars),
+         y_exceed = if_else(y_exceed, "over 75", "75 or under")) |>
+  ggplot(aes(y_exceed, value, fill = y_exceed)) +
+  geom_boxplot(outlier.size = 0.3, show.legend = FALSE) +
+  facet_wrap(~ feature, scales = "free_y", ncol = 4) +
+  labs(title = "24 h features by next-day outcome (training years)",
+       x = "Next-day PM2.5", y = NULL) +
+  theme_minimal(base_size = 9)
+```
+
+### Simple baseline: tomorrow looks like today
+
+The simplest forecast is persistence, predicting that tomorrow exceeds the threshold whenever today does. It is right about 69% of the time, with sensitivity around 0.6 and specificity around 0.75, in both periods. This is the baseline the models are compared against.
+
+```{r}
+station_day |>
+  filter(!is.na(exceed_today)) |>
+  group_by(period) |>
+  summarise(
+    n           = n(),
+    accuracy    = mean(exceed_today == y_exceed),
+    sensitivity = mean(exceed_today[y_exceed]),
+    specificity = mean(!exceed_today[!y_exceed]),
+    .groups = "drop"
+  ) |>
+  knitr::kable(digits = 3, caption = "Persistence baseline (predict today's exceedance for tomorrow)")
+```
+
+### Imputation for the modelling step
+
+Only a few station-days (about 3%) still have a missing feature after the carry-forward step, almost all in CO (its monitor is down more often than the others). They are filled with the station's training-period median, with the overall training median as fallback. The medians are estimated on training rows only and then applied to the test rows, so no test information enters the imputation.
+
+```{r}
+feature_cols <- grep("_(24h|48h)$|^PM25_last$", names(station_day), value = TRUE)
+
+train <- filter(station_day, period == "train")
+test  <- filter(station_day, period == "test")
+
+imp   <- fit_station_medians(train, feature_cols)
+train <- impute_station_medians(train, imp)
+test  <- impute_station_medians(test, imp)
+
+rows_with_na <- function(d) sum(rowSums(is.na(select(d, all_of(feature_cols)))) > 0)
+
+tibble(
+  set    = c("train", "test"),
+  before = c(rows_with_na(filter(station_day, period == "train")),
+             rows_with_na(filter(station_day, period == "test"))),
+  after  = c(rows_with_na(train), rows_with_na(test))
+) |>
+  knitr::kable(caption = "Rows with any missing feature, before and after station-median imputation")
 ```
 
 ## subsequent aims 
