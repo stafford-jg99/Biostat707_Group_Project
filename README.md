@@ -3,7 +3,7 @@ The Repository for the 707 Project
 
 # Project Goals:
 ## Project Overview & Predictive Objective
-* Predict whether tomorrow’s PM2.5 levels will exceed a predefined health threshold by modeling hourly pollutant and weather readings from a fixed 24- or 48-hour observation window.
+* Predict whether tomorrow’s PM2.5 levels will exceed a predefined health threshold (i.e., 75 µg/m³) by modeling hourly pollutant and weather readings from a fixed 24- or 48-hour observation window.
 * Evaluate and quantify the optimistic performance bias caused by temporal leakage by actively comparing naive random cross-validation results against a strict temporal validation design.
 
 ## Dataset Characteristics
