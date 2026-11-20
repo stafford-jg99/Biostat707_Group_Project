@@ -11,6 +11,8 @@ editor: visual
 source("scripts/download_data.R")
 library(tidyverse) # add other libraries as needed
 library(naniar)
+library(gt)
+library(glmnet)
 
 ## data read in 
 files <- list.files("data/raw", pattern = "\\.csv$", full.names = TRUE)
@@ -421,12 +423,698 @@ tibble(
   knitr::kable(caption = "Rows with any missing feature, before and after station-median imputation")
 ```
 
-## subsequent aims 
+## Cross Validation and Data Pre-processing - JT
 
 ```{r}
+#| label: tbl-cv-splits
+#| message: false
+# Source CV script to generate cv_fold_summaries.csv
+source("scripts/cv_and_preprocess.R")
+cv_fold_summaries <- read_csv("data/processed/cv_fold_summaries.csv", show_col_types = FALSE)
 
+# Helper function to format each scheme identically to reference table
+make_cv_gt_table <- function(summary_df, scheme_name, table_title, table_subtitle) {
+  summary_df |>
+    filter(scheme == scheme_name) |>
+    mutate(
+      val_exceed_rate = sprintf("%.2f%%", val_exceed_pct)
+    ) |>
+    select(
+      `CV Fold`                    = cv_fold,
+      `Fold Creation Descriptor`   = descriptor,
+      `Train Station-Days (N)`     = train_n,
+      `Validation Station-Days (N)`= val_n,
+      `Exceedance Days (n)`        = val_exceed_n,
+      `Exceedance Rate (%)`        = val_exceed_rate
+    ) |>
+    gt() |>
+    tab_header(
+      title    = md(paste0("**", table_title, "**")),
+      subtitle = table_subtitle
+    ) |>
+    fmt_number(
+      columns  = c(`Train Station-Days (N)`, `Validation Station-Days (N)`, `Exceedance Days (n)`),
+      decimals = 0
+    ) |>
+    cols_align(align = "center", columns = `CV Fold`) |>
+    cols_align(align = "left",   columns = `Fold Creation Descriptor`) |>
+    cols_align(align = "right",  columns = c(`Train Station-Days (N)`, `Validation Station-Days (N)`,
+                                             `Exceedance Days (n)`, `Exceedance Rate (%)`)) |>
+    cols_label(
+      `CV Fold`                     = md("**CV Fold**"),
+      `Fold Creation Descriptor`    = md("**Fold Creation Descriptor**"),
+      `Train Station-Days (N)`      = md("**Train Station-Days (N)**"),
+      `Validation Station-Days (N)` = md("**Validation Station-Days (N)**"),
+      `Exceedance Days (n)`         = md("**Exceedance Days (n)**"),
+      `Exceedance Rate (%)`         = md("**Exceedance Rate (%)**")
+    ) |>
+    opt_row_striping()
+}
+```
+
+Our dataset presents two leakage threats that must be accounted for in our cross-validation design to prevent optimistic performance results. Firstly, temporal leakage is inherent to time series data. Temporal leakage occurs when future information that would not be available at the time of prediction is included in a model's training process. In respect to or dataset, air pollution persists across multi-day weather fronts. Thus, if Tuesday and Thursday are in the training fold while Wednesday is in the validation fold, the model interpolates from neighboring days rather than genuinely forecasting ahead. Hence, an unbiased cross validation deisgn should account for this temporal bias.
+
+Secondly, we are relying on a 12-location dataset; thus, our model is susceptible to spatial leakage. Spatial leakage occurs when same-day readings from nearby, strongly correlated locations leak into the training set and inflate accuracy. All 12 monitoring stations sit within Beijing and experience the same city-wide weather and pollution episodes on any given day. If Site A on March 10 is in the training fold and Site B on March 10 is in the validation fold, the model gets a direct peek at that day's regional pollution. To demonstrate how each component of leakage threatens the internal validity of the prediction model, we designed three cross-validation schemes that progressively get more robust.
+
+```{r}
+#| label: scheme-a-split
+#| message: false
+# 1. Scheme A: Naive Stratified Random 5-Fold CV
+make_cv_gt_table(
+  cv_fold_summaries,
+  scheme_name    = "random_5fold",
+  table_title    = "Table 2a: Naive Stratified 5-Fold Cross-Validation Split Summary (train)",
+  table_subtitle = "Each training station-day is randomly assigned to one validation fold, stratified by exceedance"
+)
+```
+
+The first validation scheme is a naive stratified 5-fold cross-validation. This acts as a benchmark to quantify the optimistic performance bias of a validation design that intentionally allows for spatio-temporal leakage to occur. This design allows future days and adjacent locations into the training set, informing past and adjacent predictions. It is strictly stratified by exceedance days, assigning a random 20% of station-day rows across all 12 stations to each fold without grouping by date or station. As a result, each fold has roughly 10,220 training days and 2,550 validation days. In total, the number of exceedance days is stratified to be about 1,045 days (rate of 40.85%).
+
+```{r}
+#| label: scheme-b-split
+#| message: false
+# 2. Scheme B: Blocked Temporal 6-Fold CV with 7-Day Buffer
+make_cv_gt_table(
+  cv_fold_summaries,
+  scheme_name    = "blocked_gap_6fold",
+  table_title    = "Table 2.b: Blocked Temporal 6-Fold Cross-Validation Split Summary (train)",
+  table_subtitle = "Contiguous 6-month validation blocks across all 12 stations with a ±7-day buffer excluded from training"
+)
+```
+
+Our second validation design specifically accounts for adjacent-day autocorrelation by quarantining multi-day weather systems. Instead of outcome stratification, unique training dates are partitioned into 6 contiguous 6-month blocks across all 12 stations. Whenever a block is held out for validation, a ±7-day buffer on both sides is excluded from the training fold. This forces our models to forecast across 7-day gaps rather than interpolating between neighboring days. While holding out all 12 stations together eliminates same-day spatial leakage, this design still evaluates the same 12 stations seen during training (so it cannot test transfer to an unseen site) and allows later blocks to inform earlier blocks for interior folds.
+
+```{r}
+#| label: scheme-c-split
+#| message: false
+# 4. Scheme C: Spatio-Temporal Leave-One-Site-Out 12-Fold CV
+make_cv_gt_table(
+  cv_fold_summaries,
+  scheme_name    = "spatiotemporal_loso_12fold",
+  table_title    = "Table 2.c: Spatio-Temporal Leave-One-Site-Out (12-Fold) Split Summary (train)",
+  table_subtitle = "Trained on 11 stations in 2013–2014 and validated on the held-out 12th station in 2015"
+)
+```
+
+Our third and final cross validation design attempts to address spatio-temporal leakage with a Leave-One-Site-Out 12-Fold CV. Rather than outcome stratification, it loops over all 12 stations, training strictly on the other 11 stations during earlier years. This provides the strictest defense against both spatial and temporal leakage by testing whether models transfer to an unseen monitoring site. Because standard leave-one-site-out leaks shared city-wide weather when stations are evaluated on the same day, combining site holdout with a forward temporal split eliminates same-day spatial inflation. Note, this still comes with the limitation that because all 12 sites lie within Beijing, it measures within-city site transfer rather than generalization to a different city.
+
+## Model 1: Regularized Logistic Regression (Elastic Net) - JT
+
+We fit a logistic regression model with an Elastic Net penalty (`glmnet`) combining an $L_1$ (LASSO) penalty for sparse feature selection and an $L_2$ (ridge) penalty to stabilize collinear pollutant and meteorological summaries within each observation window (`PM25_mean_24h`, `PM25_max_24h`, `PM25_last`, `PM10_mean_24h`, and `DEWP_mean_24h`). Inside each training fold, the mixing parameter $\alpha \in \{0.25, 0.50, 0.75, 1.00\}$ and penalty strength $\lambda$ (`lambda.min`) are tuned via 5-fold blocked temporal cross-validation minimizing binomial deviance (log loss). Continuous predictors are standardized (mean 0, SD 1) inside each training fold prior to fitting so that penalty shrinkage is applied equitably and refit coefficients are directly comparable on a common scale. Furthermore, we will fit one set of models using 24 hour metrics and another set of models on 48 hour metrics to determine if the additional information provides better predictive accuracy or just increased noise.
+
+```{r}
+#| label: model1-load
+#| message: false
+# 1. Run the modeling script (this will take a few minutes as it tunes across all folds)
+source("scripts/model1_elastic_net.R")
+
+# 2. Load the saved results object into your environment
+enet_res <- readRDS("data/processed/model1_enet_results.rds")
+```
+
+### Cross-Validation Performance Across Schemes (24 h vs. 48 h)
+
+```{r}
+#| label: tbl-enet-cv-schemes
+scheme_labels <- c(
+  random_5fold               = "1. Naive Random CV (5-fold)",
+  blocked_gap_6fold          = "2. Blocked Temporal CV w/ 7-Day Gap (6-fold)",
+  spatiotemporal_loso_12fold = "3. Spatio-Temporal LOSO CV (12-fold)"
+)
+
+enet_res$scheme_summary |>
+  mutate(
+    Scheme = scheme_labels[scheme],
+    `AUROC (Mean ± SD)`      = sprintf("%.3f ± %.3f", auroc_mean, auroc_sd),
+    `Log Loss (Mean ± SD)`   = sprintf("%.3f ± %.3f", logloss_mean, logloss_sd),
+    `Brier Score (Mean ± SD)`= sprintf("%.3f ± %.3f", brier_mean, brier_sd),
+    `Persistence AUROC`      = sprintf("%.3f", persist_auroc),
+    `Mean Kept Terms`        = sprintf("%.1f / 36", mean_kept_min)
+  ) |>
+  select(Window = window, Scheme, `AUROC (Mean ± SD)`, `Log Loss (Mean ± SD)`,
+         `Brier Score (Mean ± SD)`, `Persistence AUROC`, `Mean Kept Terms`) |>
+  arrange(Window, Scheme) |>
+  knitr::kable(
+    align = "llrrrrr",
+    caption = "Table 2.2. Elastic Net out-of-fold performance across validation schemes and observation windows (2013–2015 training period)."
+  )
+```
+
+Table 2.2 summarizes Elastic Net out-of-fold performance across the three cross-validation designs and both observation windows. Across every validation scheme, the 24-hour window outperformed the 48-hour window on discrimination and probability accuracy. For example, compared to the 48 hour window the 24 hour window achieved higher AUROC (0.874 vs. 0.867), lower log loss (0.452 vs. 0.469), and a lower Brier score (0.144 vs. 0.150) under Blocked Temporal CV. Although final window selection is deferred until comparing against XGBoost, this consistent gap suggests that averaging over 48 hours dilutes recent atmospheric shifts rather than adding useful signal. In all schemes and windows, Elastic Net substantially outperformed the persistence baseline by 0.17 to 0.19 AUROC.
+
+Comparing validation designs reveals two key patterns. First, while removing adjacent-day leakage via Blocked Temporal CV reduced mean Elastic Net AUROC by only 0.005 relative to Naive Random CV (0.879 to 0.874 for 24h), it increased fold-to-fold AUROC standard deviation fivefold (± 0.005 to ± 0.025), demonstrating that naive splitting severely understates temporal performance variability. Second, although Spatio-Temporal LOSO CV yielded the highest raw AUROC (0.891 for 24h), the Persistence AUROC column shows that the held-out 2015 validation year was inherently easier to predict (0.722 vs. 0.684–0.686 across 2013–2015); relative to persistence, the net gain in LOSO (+0.169) was actually smaller than in Blocked Temporal CV (+0.190). Finally, stricter validation consistently produced sparser models, dropping from 18.0 / 36 retained terms in Naive CV to 14.5 / 36 in Blocked CV and 9.5 / 36 in LOSO (24h), indicating that only a compact core of predictors transfers reliably across time and sites
+
+### Table 3: Predictor Selection Stability & Refit Standardized Coefficients
+
+```{r}
+#| label: tbl-2-enet-stability
+enet_res$table_2_3_24h |>
+  mutate(
+    `Refit Std. Beta` = sprintf("%+.3f", beta),
+    `Refit Std. OR`   = sprintf("%.2f", std_or),
+    `Refit Status`    = if_else(kept, "Kept", "Dropped (0)"),
+    `Blocked CV Beta [Min, Max]` = sprintf("%+.3f [%+.3f, %+.3f]",
+                                           fold_beta_mean, fold_beta_min, fold_beta_max)
+  ) |>
+  select(
+    `Predictor Term`          = term,
+    `Predictor Group`         = group,
+    `Refit Status`,
+    `Refit Std. Beta`,
+    `Refit Std. OR`,
+    `Random (5f)`             = random_5fold,
+    `Blocked Gap (6f)`        = blocked_gap_6fold,
+    `Spatio-Temp LOSO (12f)`  = spatiotemporal_loso_12fold,
+    `Blocked CV Beta [Min, Max]`
+  ) |>
+  knitr::kable(
+    align = "lllcrrrrrr",
+    caption = "Table 3 Elastic Net (24 h window) standardized coefficients on the full training set and predictor selection frequencies across cross-validation schemes."
+  )
+```
+
+After refitting the 24-hour Elastic Net model on the full 2013–2015 training set, we identified a compact core of eight predictors selected in 100% of folds across all three cross-validation designs: the 23:00 (11:00 PM) PM2.5 reading, 24-hour mean southerly wind component, 24-hour minimum barometric pressure, 24-hour peak and mean ozone concentrations, 24-hour peak wind speed, 24-hour cumulative rainfall, and calendar month. None of these eight predictors changed sign across Blocked Temporal CV folds, indicating highly stable directional effects. On a standardized scale (per 1-SD increase), the 23:00 PM2.5 reading dominates the model (Std. Beta = +1.679, OR = 5.36), carrying more than triple the odds ratio of the next strongest predictor—southerly wind transport (Std. Beta = +0.561, OR = 1.75). This confirms that the latest PM2.5 concentration right before midnight is far more informative than the prior day's 24-hour mean (OR = 0.97) or peak (OR = 1.00). The meteorological predictors also act in the expected physical directions: southerly wind transport (OR = 1.75) and higher minimum barometric pressure (+0.481, OR = 1.62) increase next-day exceedance odds, whereas stronger peak winds (-0.203, OR = 0.82) and cumulative rainfall (-0.028, OR = 0.97) reduce exceedance odds.
+
+Table 2 also highlights how aggressively Elastic Net prunes redundant and collinear summaries. Of the 40 total model terms, 22 are shrunk exactly to zero in the full refit, with entire redundant families—including all three dew-point summaries and all categorical season indicators—dropped in 100% of folds. Meanwhile, secondary predictors exhibit clear instability under stricter validation: several terms selected in 100% of Naive Random CV folds—including 24-hour mean carbon monoxide, peak sulfur dioxide, peak nitrogen dioxide, and mean PM10—drop to 0–8% selection in Spatio-Temporal LOSO CV. Together, these patterns show that while the core physical signal is highly stable, secondary pollutant and calendar terms mostly reflect collinear trade-offs or localized patterns that do not generalize reliably to unseen stations in a future year
+
+### Figure 1: Refit Elastic Net Standardized Coefficients
+
+```{r}
+#| label: fig-1-enet-coefs
+#| fig-width: 9
+#| fig-height: 7
+enet_res$table_2_3_24h |>
+  mutate(
+    direction = case_when(
+      !kept     ~ "Shrunk to Zero (Dropped)",
+      beta > 0  ~ "Positive (Higher Exceedance Risk)",
+      TRUE      ~ "Negative (Lower Exceedance Risk)"
+    ),
+    term_ordered = fct_reorder(term, beta)
+  ) |>
+  ggplot(aes(x = beta, y = term_ordered, color = direction)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "grey40") +
+  geom_segment(aes(x = 0, xend = beta, y = term_ordered, yend = term_ordered),
+               linewidth = 0.8) +
+  geom_point(aes(size = kept)) +
+  scale_color_manual(
+    values = c(
+      "Positive (Higher Exceedance Risk)" = "#00539B",
+      "Negative (Lower Exceedance Risk)" = "#D95F02",
+      "Shrunk to Zero (Dropped)"          = "grey65"
+    )
+  ) +
+  scale_size_manual(values = c(`TRUE` = 2.8, `FALSE` = 1.8), guide = "none") +
+  labs(
+    title    = "Figure 1: Standardized Coefficients of Refit 24 h Elastic Net Model",
+    subtitle = sprintf("Refit on full training set (n = 12,784 station-days; alpha = %.2f, lambda.min = %.4f)",
+                       enet_res$refit_24h$tuned$alpha, enet_res$refit_24h$tuned$lambda_min),
+    x        = "Standardized Log-Odds Coefficient (per 1-SD change in continuous predictor)",
+    y        = NULL,
+    color    = "Effect Direction"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "top",
+    panel.grid.minor = element_blank()
+  )
+```
+
+
+
+## Model 2: Tree Ensemble (Gradient Boosting / XGBoost) - JT
+
+We fit a gradient-boosted decision tree ensemble (`xgboost`) minimizing binomial log loss (`objective = "binary:logistic"`, `tree_method = "hist"`). Unlike regularized logistic regression, boosted trees automatically capture non-linear threshold effects and high-order interactions between meteorological stagnation (wind vectors, dew point, pressure) and prior-day aerosol loading without pre-specifying interaction terms.
+
+- **Hyperparameter Search Range & Early Stopping:** We fix the learning rate (`eta`) at $0.05$, row subsampling (`subsample`) at $0.80$, column subsampling (`colsample_bytree`) at $0.80$, and minimum leaf Hessian weight (`min_child_weight`) at $5$. Inside each outer training fold, we construct 5 contiguous temporal inner folds and search over interaction depths `max_depth` $\in \{2, 3, 4, 6\}$ with up to `nrounds = 1500` trees, using `early_stopping_rounds = 50` on inner cross-validated log loss (deviance). Because the stopping set is drawn strictly from the inner temporal split of the training fold, the outer held-out fold is never touched during tuning or early stopping.
+
+- **Native Missing-Value Routing:** Rather than applying station-median imputation, we pass un-imputed `NA` predictor values directly to `xgb.DMatrix(..., missing = NA)`. At each split, XGBoost evaluates sending missing observations left versus right and learns the loss-minimizing default branch direction, allowing the ensemble to exploit informative sensor downtime alongside our explicit outage count features (`n_obs_pm25_*`, `n_outage_*`).
+
+```{r}
+#| label: model3-load
+#| message: false
+library(gt)
+
+if (!file.exists("data/processed/model3_xgb_results.rds")) {
+  source("scripts/model2_xgboost.R")
+}
+xgb_res <- readRDS("data/processed/model3_xgb_results.rds")
+```
+
+### Overall XGBoost Performance Across Validation Schemes (24 h vs. 48 h)
+
+```{r}
+#| label: tbl-xgb-scheme-summary
+scheme_labels <- c(
+  random_5fold               = "1. Naive Random CV (5-fold)",
+  blocked_gap_6fold          = "2. Blocked Temporal CV w/ 7-Day Gap (6-fold)",
+  temporal_year_3fold        = "3. Leave-One-Year-Out Temporal CV (3-fold)",
+  spatiotemporal_loso_12fold = "3. Spatio-Temporal LOSO CV (12-fold)"
+)
+
+xgb_res$scheme_summary |>
+  mutate(
+    Scheme                    = scheme_labels[scheme],
+    `AUROC (Mean ± SD)`       = sprintf("%.4f ± %.4f", auroc_mean, auroc_sd),
+    `Log Loss (Mean ± SD)`    = sprintf("%.4f ± %.4f", logloss_mean, logloss_sd),
+    `Brier Score (Mean ± SD)` = sprintf("%.4f ± %.4f", brier_mean, brier_sd),
+    `Persistence AUROC`       = sprintf("%.4f", persist_auroc),
+    `Median Depth`            = sprintf("%d", as.integer(median_depth)),
+    `Mean Trees (nrounds)`    = sprintf("%.0f", mean_nrounds)
+  ) |>
+  filter(scheme != "temporal_year_3fold") %>% 
+  select(Window = window, Scheme, `AUROC (Mean ± SD)`, `Log Loss (Mean ± SD)`,
+         `Brier Score (Mean ± SD)`, `Persistence AUROC`, `Median Depth`, `Mean Trees (nrounds)`) |>
+  arrange(Window, Scheme) |>
+  knitr::kable(
+    align = "llrrrrrr",
+    caption = "Table 4. XGBoost out-of-fold performance across validation schemes and observation windows (2013–2015 training period)."
+  )
+```
+
+Table 3 summarizes XGBoost out-of-fold performance across the three cross-validation designs and both observation windows. Mirroring the Elastic Net results, the 24-hour window outperformed the 48-hour window on every metric across all validation schemes—for example, achieving higher AUROC (0.8749 vs. 0.8693), lower log loss (0.4288 vs. 0.4401), and a lower Brier score (0.1393 vs. 0.1428) under Blocked Temporal CV. This confirms across both linear and tree-based model families that expanding the feature window to 48 hours dilutes recent atmospheric shifts rather than adding predictive signal. Across all schemes and windows, XGBoost substantially outperformed the persistence baseline by 0.17 to 0.22 AUROC.
+
+Comparing validation designs highlights how aggressively flexible tree ensembles exploit spatio-temporal leakage. First, unlike Elastic Net (whose mean AUROC fell by only 0.005), blocking adjacent-day leakage caused 24-hour XGBoost AUROC to drop sharply by 0.0333 (0.9082 in Naive Random CV to 0.8749 in Blocked Temporal CV), while increasing log loss (0.3799 to 0.4288), Brier score (0.1214 to 0.1393), and fold-to-fold AUROC standard deviation more than fourfold (± 0.0073 to ± 0.0298). Second, although Spatio-Temporal LOSO CV again yielded a high raw AUROC (0.9041 for 24h) and the lowest overall Brier score (0.1190), the Persistence AUROC column confirms that the held-out 2015 validation year was inherently easier to predict (0.7221 vs. 0.6843–0.6860 across 2013–2015); relative to persistence, the net gain in LOSO (+0.1820) was smaller than in Blocked Temporal CV (+0.1906). Finally, stricter validation consistently constrained tree complexity: inner tuning selected deeper trees in Naive Random CV (Median Depth = 4 for 24h; 3 for 48h) that could memorize leaked neighbors, but simplified to shallow depth-2 trees across both Blocked Temporal (133 mean trees) and Spatio-Temporal LOSO (167 mean trees) designs, indicating that higher-order interactions do not transfer reliably across temporal gaps or to unseen sites.
+
+### Per-Fold Cross-Validation Tuning Tables (Tables 2.5a–2.5c)
+
+```{r}
+#| label: tbl-5-xgb-folds
+make_xgb_tuning_gt <- function(metrics_df, scheme_name, window_choice = "24h",
+                               table_title, table_subtitle) {
+  sub_df <- metrics_df |>
+    filter(window == window_choice, scheme == scheme_name) |>
+    arrange(cv_fold)
+
+  # Format fold rows
+  rows_formatted <- sub_df |>
+    transmute(
+      `CV Fold`                 = as.character(cv_fold),
+      `Fold Descriptor`         = descriptor,
+      `Optimal Tree Depth`      = as.character(optimal_depth),
+      `Optimal Trees (nrounds)` = as.character(optimal_nrounds),
+      `Inner CV Deviance`       = sprintf("%.4f", inner_deviance),
+      `Out-of-Fold AUROC`       = sprintf("%.4f", auroc)
+    )
+
+  # Append Mean ± SD summary row
+  summary_row <- tibble(
+    `CV Fold`                 = "Mean ± SD",
+    `Fold Descriptor`         = sprintf("Across all %d folds (%s window)", nrow(sub_df), window_choice),
+    `Optimal Tree Depth`      = sprintf("Median: %d", as.integer(median(sub_df$optimal_depth))),
+    `Optimal Trees (nrounds)` = sprintf("%.1f ± %.1f", mean(sub_df$optimal_nrounds), sd(sub_df$optimal_nrounds)),
+    `Inner CV Deviance`       = sprintf("%.4f ± %.4f", mean(sub_df$inner_deviance), sd(sub_df$inner_deviance)),
+    `Out-of-Fold AUROC`       = sprintf("%.4f ± %.4f", mean(sub_df$auroc), sd(sub_df$auroc))
+  )
+
+  bind_rows(rows_formatted, summary_row) |>
+    gt() |>
+    tab_header(
+      title    = md(paste0("**", table_title, "**")),
+      subtitle = table_subtitle
+    ) |>
+    cols_align(align = "center", columns = `CV Fold`) |>
+    cols_align(align = "left",   columns = `Fold Descriptor`) |>
+    cols_align(align = "right",  columns = c(`Optimal Tree Depth`, `Optimal Trees (nrounds)`,
+                                             `Inner CV Deviance`, `Out-of-Fold AUROC`)) |>
+    cols_label(
+      `CV Fold`                 = md("**CV Fold**"),
+      `Fold Descriptor`         = md("**Fold Descriptor**"),
+      `Optimal Tree Depth`      = md("**Optimal Tree Depth**"),
+      `Optimal Trees (nrounds)` = md("**Optimal Trees (nrounds)**"),
+      `Inner CV Deviance`       = md("**Inner CV Deviance**"),
+      `Out-of-Fold AUROC`       = md("**Out-of-Fold AUROC**")
+    ) |>
+    tab_style(
+      style     = list(cell_text(weight = "bold"), cell_fill(color = "#F0F4F8")),
+      locations = cells_body(rows = nrow(sub_df) + 1)
+    ) |>
+    opt_row_striping()
+}
+
+# Table 5.a: Scheme 1 - Naive Stratified Random 5-Fold CV
+make_xgb_tuning_gt(
+  xgb_res$fold_metrics,
+  scheme_name    = "random_5fold",
+  window_choice  = "24h",
+  table_title    = "Table 2.5a: Model 2 (Gradient Boosting / XGBoost) Tuning — Naive Random 5-Fold CV",
+  table_subtitle = "Tree depth and boosting iterations tuned via inner 5-fold temporal CV early stopping (24 h window)"
+)
+
+# Table 5.b: Scheme 2 - Blocked Temporal 6-Fold CV with 7-Day Gap
+make_xgb_tuning_gt(
+  xgb_res$fold_metrics,
+  scheme_name    = "blocked_gap_6fold",
+  window_choice  = "24h",
+  table_title    = "Table 2.5b: Model 2 (Gradient Boosting / XGBoost) Tuning — Blocked Temporal 6-Fold CV",
+  table_subtitle = "Contiguous 6-month validation blocks with ±7-day buffer; tuned via inner 5-fold temporal CV early stopping (24 h window)"
+)
+
+# Table 5.d: Scheme 3 - Spatio-Temporal Leave-One-Site-Out 12-Fold CV
+make_xgb_tuning_gt(
+  xgb_res$fold_metrics,
+  scheme_name    = "spatiotemporal_loso_12fold",
+  window_choice  = "24h",
+  table_title    = "Table 2.5c: Model 2 (Gradient Boosting / XGBoost) Tuning — Spatio-Temporal LOSO 12-Fold CV",
+  table_subtitle = "Trained on 11 stations (2013–2014) and validated on held-out station (2015); tuned via inner 5-fold temporal CV (24 h window)"
+)
+```
+
+Examining the per-fold XGBoost tuning results (Tables 5.a–5.b) demonstrates how severely naive random splitting masks real-world temporal variability. Under Naive Random 5-Fold CV (Table 2.5a), out-of-fold AUROC is compressed into an artificially tight range of 0.8966 to 0.9159 (SD = 0.0073), with inner tuning consistently favoring deeper, more complex trees (depth = 3–4, 100–140 boosting rounds) capable of exploiting adjacent-day leakage. Once temporal autocorrelation is blocked with a ±7-day gap (Table 2.5b), out-of-fold AUROC spans nearly 9 percentage points across the 6-month blocks—ranging from 0.8325 in Fold 1 (Spring/Summer 2013) to 0.9221 in Fold 6 (Autumn/Winter 2015–2016; SD = 0.0298). Notably, inner CV deviance moves inversely to outer AUROC across these blocks (0.4100 in Fold 1 vs. 0.4484 in Fold 6), reflecting genuine multi-year regime shifts as Beijing's air quality became progressively cleaner and more predictable between 2013 and late 2015. Blocking temporal leakage also simplified the learned tree structure, with four of the six folds (Folds 3–6) dropping to shallow depth = 2 trees (121–200 rounds) rather than relying on higher-order splits.
+
+The Spatio-Temporal LOSO per-fold results (Table 5.c) reinforce both hyperparameter stability and within-city spatial transferability. Across all 12 held-out stations in season-year 2015, inner tuning unanimously selected shallow depth = 2 trees (12/12 folds) with virtually identical inner CV deviance (0.4557–0.4593, SD = 0.0011), varying only in early-stopping tree count (124 rounds for Gucheng to 200 for Wanshouxigong). Out-of-fold discrimination varied modestly by 0.033 across Beijing's monitoring network, with the highest AUROC at outer northern/suburban sites such as Huairou (0.9214) and Shunyi (0.9142) and the lowest at central urban sites such as Dongsi (0.8883) and Tiantan (0.8915). Because even the most challenging unseen station achieved an AUROC above 0.888 using shallow two-way interactions, these per-fold results confirm that the predictive signal transfers reliably across sites
+
+### Figure 2: Early-Stopping Learning Curve & Feature Importance (Gain)
+
+```{r}
+#| label: fig-2-xgb-diagnostics
+#| fig-width: 10
+#| fig-height: 4.5
+elog <- xgb_res$refit_24h$tuned$eval_log
+best_r <- xgb_res$refit_24h$tuned$best_nrounds
+
+# Standardize column names from xgb.cv evaluation_log
+train_col <- grep("^train.*logloss.*mean$", names(elog), value = TRUE)[1]
+val_col   <- grep("^(test|valid|eval).*logloss.*mean$", names(elog), value = TRUE)[1]
+
+p_curve <- elog |>
+  transmute(
+    iter = row_number(),
+    `Inner Training Portion (80%)`   = .data[[train_col]],
+    `Inner Validation Portion (20%)` = .data[[val_col]]
+  ) |>
+  pivot_longer(-iter, names_to = "Split", values_to = "logloss") |>
+  ggplot(aes(x = iter, y = logloss, color = Split)) +
+  geom_line(linewidth = 0.9) +
+  geom_vline(xintercept = best_r, linetype = "dashed", color = "grey30") +
+  scale_color_manual(values = c(
+    "Inner Training Portion (80%)"   = "grey55",
+    "Inner Validation Portion (20%)" = "#00539B"
+  )) +
+  labs(
+    title    = "Figure 2.2a: XGBoost Log Loss by Boosting Round",
+    subtitle = sprintf("Full training set 5-fold inner CV (max_depth = %d, best round = %d)",
+                       xgb_res$refit_24h$tuned$best_depth, best_r),
+    x        = "Boosting Round (nrounds)",
+    y        = "Binomial Log Loss (Deviance)",
+    color    = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+
+p_imp <- xgb_res$refit_24h$importance |>
+  slice_head(n = 15) |>
+  mutate(Feature = fct_reorder(Feature, Gain)) |>
+  ggplot(aes(x = Gain, y = Feature)) +
+  geom_col(fill = "#00539B", width = 0.7) +
+  labs(
+    title    = "Figure 2.2b: Top 15 Predictors by Relative Gain",
+    subtitle = "Share of total log-loss reduction across all splits (24 h refit)",
+    x        = "Relative Gain (Share of Total Loss Reduction)",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11)
+
+gridExtra::grid.arrange(p_curve, p_imp, ncol = 2)
+```
+
+## Comparison of Models and Choice of Final Model - JT
+
+We compare **Model 1 (Elastic Net)**, **Model 2 (Gradient Boosting / XGBoost)**, and the **Persistence Baseline (`exceed_today`)** across identical cross-validation splits for all three validation designs. The persistence baseline is evaluated on the station-days in each validation fold that have a valid current-day exceedance reading ($\ge 20$ observed PM2.5 hours on day $d$; $192$ of $12,784$ training station-days are excluded from the baseline calculation due to monitor outages on day $d$, and the exact count is reported per fold).
+
+```{r}
+#| label: sec2-7-load
+#| message: false
+source("scripts/compare_models.R")
+comp_res <- readRDS("output/model_comparison_summary.rds")
+
+comp_res$scheme_comparison_summary
+```
+
+### Per-Fold AUROC Comparison Tables Across Validation Designs (Tables 2.6a–2.6c)
+
+```{r}
+#| label: tbl-6-model-comparison
+make_comparison_gt <- function(wide_df, scheme_name, table_title, table_subtitle) {
+  sub <- wide_df |>
+    filter(scheme == scheme_name) |>
+    arrange(cv_fold)
+
+  rows_fmt <- sub |>
+    transmute(
+      `CV Fold`               = as.character(cv_fold),
+      `Fold Descriptor`       = descriptor,
+      `Elastic Net (24h)`     = sprintf("%.4f", auroc_enet_24h),
+      `XGBoost (24h)`         = sprintf("%.4f", auroc_xgb_24h),
+      `Elastic Net (48h)`     = sprintf("%.4f", auroc_enet_48h),
+      `XGBoost (48h)`         = sprintf("%.4f", auroc_xgb_48h),
+      `Persistence Baseline`  = sprintf("%.4f (excl. %d)", auroc_persist, n_persist_excluded)
+    )
+
+  summary_row <- tibble(
+    `CV Fold`               = "Mean ± SD",
+    `Fold Descriptor`       = sprintf("Across all %d folds (total baseline excl. = %d)",
+                                      nrow(sub), sum(sub$n_persist_excluded)),
+    `Elastic Net (24h)`     = sprintf("%.4f ± %.4f", mean(sub$auroc_enet_24h), sd(sub$auroc_enet_24h)),
+    `XGBoost (24h)`         = sprintf("%.4f ± %.4f", mean(sub$auroc_xgb_24h),  sd(sub$auroc_xgb_24h)),
+    `Elastic Net (48h)`     = sprintf("%.4f ± %.4f", mean(sub$auroc_enet_48h), sd(sub$auroc_enet_48h)),
+    `XGBoost (48h)`         = sprintf("%.4f ± %.4f", mean(sub$auroc_xgb_48h),  sd(sub$auroc_xgb_48h)),
+    `Persistence Baseline`  = sprintf("%.4f ± %.4f", mean(sub$auroc_persist),  sd(sub$auroc_persist))
+  )
+
+  bind_rows(rows_fmt, summary_row) |>
+    gt() |>
+    tab_header(
+      title    = md(paste0("**", table_title, "**")),
+      subtitle = table_subtitle
+    ) |>
+    cols_align(align = "center", columns = `CV Fold`) |>
+    cols_align(align = "left",   columns = `Fold Descriptor`) |>
+    cols_align(align = "right",  columns = c(`Elastic Net (24h)`, `XGBoost (24h)`,
+                                             `Elastic Net (48h)`, `XGBoost (48h)`,
+                                             `Persistence Baseline`)) |>
+    cols_label(
+      `CV Fold`              = md("**CV Fold**"),
+      `Fold Descriptor`      = md("**Fold Descriptor**"),
+      `Elastic Net (24h)`    = md("**Elastic Net (24h)**"),
+      `XGBoost (24h)`        = md("**XGBoost (24h)**"),
+      `Elastic Net (48h)`    = md("**Elastic Net (48h)**"),
+      `XGBoost (48h)`        = md("**XGBoost (48h)**"),
+      `Persistence Baseline` = md("**Persistence Baseline**")
+    ) |>
+    tab_style(
+      style     = list(cell_text(weight = "bold"), cell_fill(color = "#F0F4F8")),
+      locations = cells_body(rows = nrow(sub) + 1)
+    ) |>
+    opt_row_striping()
+}
+
+# 1. Naive Stratified Random 5-Fold CV
+make_comparison_gt(
+  comp_res$fold_comparison_wide,
+  scheme_name    = "random_5fold",
+  table_title    = "Table 6.a: Out-of-Fold AUROC Comparison — Naive Stratified Random 5-Fold CV",
+  table_subtitle = "Per-fold AUROC, Mean ± SD across Models 1 (Elastic Net), 2 (XGBoost), and Persistence Baseline"
+)
+
+# 2. Blocked Temporal 6-Fold CV with 7-Day Buffer Gap
+make_comparison_gt(
+  comp_res$fold_comparison_wide,
+  scheme_name    = "blocked_gap_6fold",
+  table_title    = "Table 6.b: Out-of-Fold AUROC Comparison — Blocked Temporal 6-Fold CV (±7-Day Gap)",
+  table_subtitle = "Per-fold AUROC, Mean ± SD across Models 1 (Elastic Net), 2 (XGBoost), and Persistence Baseline"
+)
+
+# 4. Spatio-Temporal Leave-One-Site-Out 12-Fold CV
+make_comparison_gt(
+  comp_res$fold_comparison_wide,
+  scheme_name    = "spatiotemporal_loso_12fold",
+  table_title    = "Table 6.c: Out-of-Fold AUROC Comparison — Spatio-Temporal LOSO 12-Fold CV",
+  table_subtitle = "Per-fold AUROC, Mean ± SD across Models 1 (Elastic Net), 2 (XGBoost), and Persistence Baseline"
+)
+```
+
+Across all three cross-validation designs (Tables 6a–6c), both modeling families substantially outperformed the Persistence Baseline by 0.17 to 0.22 AUROC—exceeding the fold-to-fold standard deviation by more than fourfold in every scheme. Likewise, the 24-hour observation window consistently outperformed the 48-hour window across every model and validation specification (for example, improving Blocked Temporal AUROC from 0.8668 to 0.8744 for Elastic Net and from 0.8693 to 0.8749 for XGBoost), allowing us to rule out the noisier 48-hour feature set.
+
+Comparing Elastic Net (24h) against XGBoost (24h) across the validation ladder reveals how strongly leakage can distort model selection. Under Naive Stratified Random 5-Fold CV (Table 2.6a), XGBoost appeared to deliver a decisive +0.0294 AUROC advantage (0.9082 ± 0.0073 vs. 0.8788 ± 0.0049), outperforming Elastic Net in all five folds by exploiting adjacent-day and same-day spatial neighbors. Once temporal autocorrelation was quarantined under Blocked Temporal 6-Fold CV with a ±7-day gap (Table 6.b), that advantage vanished: the two models were virtually tied in mean AUROC (0.8749 ± 0.0298 for XGBoost vs. 0.8744 ± 0.0248 for Elastic Net, a +0.0005 gap dwarfed by fold-to-fold variability), and Elastic Net actually outperformed XGBoost in four of the six 6-month blocks (Folds 1–4, spanning 2013–2014) with lower variance. Under Spatio-Temporal LOSO 12-Fold CV (Table 2.6c), XGBoost regained a consistent +0.0131 edge across all 12 held-out stations (0.9041 ± 0.0096 vs. 0.8910 ± 0.0097), mirroring its stronger performance during the cleaner 2015–2016 period (Folds 5–6 of Table 6.b).
+
+Evaluating both leak-free designs together—multi-year temporal generalization (Scheme B) and unseen-site transfer across Beijing (Scheme C)—shows that while 24-hour XGBoost achieves the highest raw AUROC in the 2015 LOSO split, it provides no net discrimination gain over the full 2013–2015 timeline. Because a simpler, directly interpretable Elastic Net model is preferred unless a complex tree ensemble delivers a clear, reliable gain, we next conduct a paired 14-day block-bootstrap comparison on out-of-fold predictions to formally quantify whether XGBoost's differences in AUROC and Brier score are practically and statistically meaningful before locking in our final model.
+
+### Out-of-Fold ROC Curves for Each Validation Design (Figures 3.a–3.c)
+
+```{r}
+#| label: fig-3-roc-curves
+#| fig-width: 8
+#| fig-height: 6
+plot_scheme_roc <- function(roc_df, sum_df, scheme_name, fig_title) {
+  s_row <- sum_df |> filter(scheme == scheme_name)
+
+  # Build legend labels showing Mean ± SD across folds
+  lbl_map <- c(
+    "Model 1: Elastic Net"            = sprintf("Elastic Net (24h): %.3f ± %.3f",
+                                                s_row$enet_24h_mean, s_row$enet_24h_sd),
+    "Model 2: XGBoost"                = sprintf("XGBoost (24h): %.3f ± %.3f",
+                                                s_row$xgb_24h_mean, s_row$xgb_24h_sd),
+    "Benchmark: Persistence Baseline" = sprintf("Persistence Baseline: %.3f ± %.3f",
+                                                s_row$persist_mean, s_row$persist_sd)
+  )
+
+  roc_df |>
+    filter(scheme == scheme_name) |>
+    mutate(model_lbl = factor(lbl_map[model], levels = unname(lbl_map))) |>
+    ggplot(aes(x = fpr, y = tpr, color = model_lbl, linetype = model_lbl)) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "grey55") +
+    geom_line(linewidth = 1.0) +
+    scale_color_manual(values = c("#00539B", "#D95F02", "#2B8CBE")) +
+    scale_linetype_manual(values = c("solid", "solid", "dashed")) +
+    coord_equal() +
+    labs(
+      title    = fig_title,
+      subtitle = "Out-of-fold ROC curves (legend reports fold AUROC Mean ± SD)",
+      x        = "1 - Specificity (False Positive Rate)",
+      y        = "Sensitivity (True Positive Rate)",
+      color    = NULL,
+      linetype = NULL
+    ) +
+    theme_minimal(base_size = 10.5) +
+    theme(
+      legend.position   = c(0.63, 0.22),
+      legend.background = element_rect(fill = alpha("white", 0.85), color = "grey85"),
+      panel.grid.minor  = element_blank()
+    )
+}
+
+p_roc_1 <- plot_scheme_roc(
+  comp_res$roc_curves_24h, comp_res$scheme_comparison_summary,
+  "random_5fold", "Figure 2.3a: Naive Random 5-Fold CV"
+)
+p_roc_2 <- plot_scheme_roc(
+  comp_res$roc_curves_24h, comp_res$scheme_comparison_summary,
+  "blocked_gap_6fold", "Figure 2.3b: Blocked Temporal 6-Fold CV (±7d Gap)"
+)
+
+p_roc_3 <- plot_scheme_roc(
+  comp_res$roc_curves_24h, comp_res$scheme_comparison_summary,
+  "spatiotemporal_loso_12fold", "Figure 2.3d: Spatio-Temporal LOSO 12-Fold CV"
+)
+
+gridExtra::grid.arrange(p_roc_1, p_roc_2, p_roc_3, ncol = 3)
+```
+
+### Paired Block-Bootstrap Comparison: XGBoost (24h) vs. Elastic Net (24h)
+
+To test whether the observed differences between XGBoost (Model B) and Elastic Net (Model A) exceed sampling variation, we apply a **paired 14-day block bootstrap** ($B = 2,000$ resamples) to the pooled out-of-fold predictions for each validation scheme. Resampling contiguous 14-day date blocks keeps all 12 monitoring stations on each day and multi-day weather regimes together, accounting for both spatial correlation across Beijing and temporal autocorrelation. Because the fitted fold models remain fixed during resampling, these 95% percentile intervals reflect sampling variation across evaluation periods rather than model-training variation.
+
+```{r}
+#| label: tbl-paired-bootstrap
+#| message: false
+source("scripts/paired_bootstrap.R")
+boot_res <- readRDS("output/paired_bootstrap_results.rds")
+
+scheme_labels <- c(
+  random_5fold               = "1. Naive Random CV (5-fold)",
+  blocked_gap_6fold          = "2. Blocked Temporal CV (±7d Gap, 6-fold)",
+  temporal_year_3fold        = "3. Leave-One-Year-Out Temporal CV (3-fold)",
+  spatiotemporal_loso_12fold = "3. Spatio-Temporal LOSO CV (12-fold)"
+)
+
+boot_res$summary |>
+  filter(metric %in% c("AUROC", "Brier Score")) |>
+  mutate(
+    Scheme            = factor(scheme_labels[scheme], levels = unname(scheme_labels)),
+    `Elastic Net (95% CI)` = sprintf("%.4f (%.4f, %.4f)", enet_est, enet_lo, enet_hi),
+    `XGBoost (95% CI)`     = sprintf("%.4f (%.4f, %.4f)", xgb_est,  xgb_lo,  xgb_hi),
+    `XGB − ENet (95% CI)`  = sprintf("%+.4f (%+.4f, %+.4f)", diff_est, diff_lo, diff_hi),
+    `Corr (A, B)`          = sprintf("%.2f", corr_ab),
+    `XGB Wins (%)`         = sprintf("%.1f%%", pct_xgb_wins)
+  ) |>
+    filter(scheme != "temporal_year_3fold") %>% 
+  arrange(metric, Scheme) |>
+  select(
+    Metric = metric, Scheme, `14d Blocks` = n_blocks,
+    `Elastic Net (95% CI)`, `XGBoost (95% CI)`, `XGB − ENet (95% CI)`,
+    `Corr (A, B)`, `XGB Wins (%)`
+  ) |>
+  gt(groupname_col = "Metric") |>
+  tab_header(
+    title    = md("**Table 7: Paired 14-Day Block-Bootstrap Comparison (XGBoost 24h − Elastic Net 24h)**"),
+    subtitle = "B = 2,000 paired block resamples on pooled out-of-fold predictions. Positive ΔAUROC and negative ΔBrier favor XGBoost."
+  ) |>
+  cols_align(align = "left",  columns = Scheme) |>
+  cols_align(align = "right", columns = c(`14d Blocks`, `Elastic Net (95% CI)`,
+                                          `XGBoost (95% CI)`, `XGB − ENet (95% CI)`,
+                                          `Corr (A, B)`, `XGB Wins (%)`)) |>
+  opt_row_striping()
 ```
 
 ```{r}
+#| label: fig-paired-bootstrap-hist
+#| fig-width: 10
+#| fig-height: 6.5
+# Bootstrap distribution of AUC(XGBoost) - AUC(Elastic Net) across all 4 schemes
+auc_sum <- boot_res$summary |>
+  filter(metric == "AUROC") |>
+  mutate(Scheme = factor(scheme_labels[scheme], levels = unname(scheme_labels))) %>% 
+      filter(scheme != "temporal_year_3fold")
 
+boot_res$draws |>
+  mutate(Scheme = factor(scheme_labels[scheme], levels = unname(scheme_labels))) |>
+      filter(scheme != "temporal_year_3fold") %>% 
+  ggplot(aes(x = d_auc)) +
+  geom_histogram(bins = 40, fill = "grey75", color = "white") +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.7) +
+  geom_vline(data = auc_sum, aes(xintercept = diff_est), color = "black", linewidth = 0.9) +
+  geom_vline(data = auc_sum, aes(xintercept = diff_lo),  color = "#B2182B", linewidth = 0.8) +
+  geom_vline(data = auc_sum, aes(xintercept = diff_hi),  color = "#B2182B", linewidth = 0.8) +
+  facet_wrap(~ Scheme, scales = "free_y", ncol = 2) +
+  labs(
+    title    = "Figure 4: Paired Block-Bootstrap Distribution of ΔAUROC (XGBoost − Elastic Net)",
+    subtitle = "Solid black: observed difference | Red lines: 95% percentile CI | Dashed line: 0 (no difference)",
+    x        = "AUROC(XGBoost 24h) − AUROC(Elastic Net 24h) in 14-day block resample",
+    y        = "Number of resamples (out of 2,000)"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+```{r}
+#| label: fig-paired-bootstrap-scatter
+#| fig-width: 6.5
+#| fig-height: 5.5
+# Paired scatter plot for primary temporal scheme
+blk_sum   <- boot_res$summary |> filter(scheme == "spatiotemporal_loso_12fold", metric == "AUROC")
+blk_draws <- boot_res$draws   |> filter(scheme == "spatiotemporal_loso_12fold")
+
+ggplot(blk_draws, aes(x = auc_enet, y = auc_xgb)) +
+  geom_point(alpha = 0.25, size = 1.3, color = "grey20") +
+  geom_abline(slope = 1, intercept = 0, color = "#B2182B", linewidth = 0.9) +
+  coord_equal() +
+  labs(
+    title    = "Figure 5: Paired Resample AUROCs (Spatio-Temporal LOSO CV (12-fold))",
+    subtitle = sprintf("Correlation r = %.2f | XGBoost exceeds Elastic Net in %.1f%% of 14-day block resamples",
+                       blk_sum$corr_ab, blk_sum$pct_xgb_wins),
+    x        = "Elastic Net (24h) AUROC in resample",
+    y        = "XGBoost (24h) AUROC in resample"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+Over the full 3-year timeline (Blocked Temporal CV), XGBoost fails to demonstrate a statistically reliable AUROC gain (-0.0022 to +0.0112) and offers only a 0.0046 Brier improvement. As a result, out final model will be the elastic net over 24 hours.
+
+### Final Model Save
+
+```{r}
+enet_res     <- readRDS(file.path("data", "processed", "model1_enet_results.rds"))
+oof_combined <- read_csv(file.path("data", "processed", "oof_predictions.csv"), show_col_types = FALSE)
+
+# 1. Save the final refit model object (includes the tuned cv.glmnet fit and scaling parameters)
+final_model <- enet_res$refit_24h
+saveRDS(final_model, file.path("output", "final_model.rds"))
+
+# 2. Save the out-of-fold predictions for the chosen model
+oof_final <- oof_combined |> 
+  filter(window == "24h") |> 
+  select(scheme, cv_fold, fold_id, station, date, target_date, y_exceed, exceed_today, p_enet_min)
+
+write_csv(oof_final, file.path("output", "oof_predictions.csv"))
 ```
