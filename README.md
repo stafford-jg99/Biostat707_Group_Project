@@ -79,8 +79,8 @@ scripts/download_data.R              downloads the 12 station CSVs to data/raw/ 
 scripts/build_features.R             cleans hourly data and builds the station-day modeling table
 scripts/impute.R                     fold-safe station-median imputation (fit on training rows only)
 scripts/cv_and_preprocess.R          generates CV folds and fold-level preprocessing pipelines
-scripts/fit_enet.R                   fits nested-CV Elastic Net models (24h & 48h) and full refit*
-scripts/fit_xgboost.R                fits nested-CV XGBoost models (24h & 48h)*
+scripts/model1_elastic_net.R         fits nested-CV Elastic Net models (24h & 48h) and full refit*
+scripts/model2_xgboost.R             fits nested-CV XGBoost models (24h & 48h)*
 scripts/compare_models.R             compiles cross-scheme comparison tables and ROC coordinates
 scripts/paired_bootstrap.R           runs B = 2,000 paired 14-day block-bootstrap comparisons
 707_finalproj_code.qmd               full analysis report: EDA, cleaning log, CV, modeling & selection
