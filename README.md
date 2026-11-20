@@ -132,8 +132,8 @@ Cleaning rules and the number of hourly values each touched are in `data/process
 * **Train/test split.** Currently target days before 2016-03-01 are training (three years) and the final year is test. Change `test_start` in `scripts/build_features.R` if the group prefers a different cut. `season_year` allows rolling-origin validation inside the training years.
 * **Imputation.** `scripts/impute.R` must be fit on the training rows of each fold and applied to the held-out rows; fitting it on the whole table first is leakage.
 
-#Project Status & Next Steps
-##Completed
+# Project Status & Next Steps
+## Completed
 * Data ingestion, hourly cleaning log, and station-day feature engineering (24h and 48h windows).
 
 * Exploratory data analysis, missingness auditing, and spatio-temporal correlation assessment.
