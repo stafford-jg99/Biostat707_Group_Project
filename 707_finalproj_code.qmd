@@ -22,7 +22,7 @@ air_qual_data <- do.call(rbind, lapply(files, read.csv))
 
 ```
 
-## Data Cleaning & Exploratory Analysis - JS, TD
+## Data Cleaning & Exploratory Analysis - JS
 
 ```{r}
 # Collapse the year, month, day, and hour columns into one column variable
@@ -102,13 +102,6 @@ daily_avg_pm25 <- air_qual_data |>
 daily_avg_pm25 <- daily_avg_pm25 |>
   mutate(h_threshold = pm25_avg > 75)
 
-# code to claculate how many observations we have per station per day, the number of days that we removed due to not having 20 hours of measurements, the percentage that surpass the health threshold 
-daily_avg_pm25 |>
-  summarize(
-    n_perstation_perday= n(),
-    total_dropped = sum(is.na(h_threshold)),
-    pct_over_threshold = mean(h_threshold, na.rm = TRUE) * 100
-  )
 
 # heat map 
 daily_avg_pm25 |>
@@ -125,25 +118,6 @@ daily_avg_pm25 |>
   theme_minimal() +
   theme(panel.grid = element_blank())
 
-
-# ADD two columns to the daily_avg_pm25 dataset...the first new column shows the next day's average pm25 ...the second states whether its over threshold
-two_day_pm25 <- daily_avg_pm25 |>
-  group_by(station) |>
-  arrange(date, .by_group = TRUE) |>
-  mutate(next_day_avg = lead(pm25_avg),
-         next_day_thresh = lead(h_threshold)) |>
-  ungroup() |>
-  filter(date < as.Date("2016-02-29"))
-
-
-# check on correlation and what would happen if we went off the previous day's reading to determine whether the threshold would be passed on the next day 
-
-two_day_pm25 |>
-  summarize(
-    correlation = cor(pm25_avg, next_day_avg, use = "complete.obs"),
-    pct_same = mean(h_threshold == next_day_thresh, na.rm = TRUE) * 100,
-    pct_no = mean(!next_day_thresh, na.rm = TRUE) * 100
-  )
 
 acf_by_station <- daily_avg_pm25 |>
   filter(date < as.Date("2016-03-01")) |>
@@ -198,15 +172,11 @@ as_tibble(station_cor, rownames = "station_1") |>
 
 
 
-
-## CHECK FOR ODD VALUES NEXT/ # Build Table 1 / IMPUTATION
-
-
 ```
 
 ## Data Cleaning Rules, Feature Table & Table 1 - TD
 
-The hourly data are cleaned and summarised into one row per station-day by `scripts/build_features.R`; the imputation functions are in `scripts/impute.R`. The resulting table (`data/processed/station_day_features.csv`) is the input to all models. Two aspects of the design, the prediction window (24 h vs 48 h) and the train/test split, are still under discussion and are noted where they arise.
+The hourly data are cleaned and summarizeded into one row per station-day by `scripts/build_features.R`; the imputation functions are in `scripts/impute.R`. The resulting table (`data/processed/station_day_features.csv`) is the input to all models. Two aspects of the design, the prediction window (24 h vs 48 h) and the train/test split, are still under discussion and are noted where they arise.
 
 ```{r}
 #| message: false
@@ -639,8 +609,6 @@ enet_res$table_2_3_24h |>
     panel.grid.minor = element_blank()
   )
 ```
-
-
 
 ## Model 2: Tree Ensemble (Gradient Boosting / XGBoost) - JT
 
